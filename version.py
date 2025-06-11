@@ -2,8 +2,8 @@
 Version information for VMware Snapshot Manager
 """
 
-__version__ = "1.2.4"
-__version_info__ = (1, 2, 4)
+__version__ = "1.2.5"
+__version_info__ = (1, 2, 5)
 
 # Build metadata (optional)
 __author__ = "Christian Salas"

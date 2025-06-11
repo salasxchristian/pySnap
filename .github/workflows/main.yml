@@ -37,10 +37,12 @@ jobs:
       - name: Run Tests
         run: python run_tests.py
       
-      - name: Validate Version
+      - name: Update README version badge
         run: |
           VERSION=$(python -c "from version import __version__; print(__version__)")
           echo "Current version: $VERSION"
+          sed -i "s/!\[pySnap v[0-9]\+\.[0-9]\+\.[0-9]\+\]/![pySnap v$VERSION]/" README.md
+          sed -i "s/version-[0-9]\+\.[0-9]\+\.[0-9]\+-blue/version-$VERSION-blue/" README.md
 
   build-windows:
     runs-on: windows-latest
