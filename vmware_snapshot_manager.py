@@ -270,17 +270,23 @@ class AddVCenterDialog(QDialog):
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         layout.addWidget(self.password, 3, 1)
         
+        # SSL verification checkbox
+        self.verify_ssl_check = QCheckBox("Verify SSL Certificate")
+        self.verify_ssl_check.setChecked(False)  # Default to disabled for compatibility
+        self.verify_ssl_check.setToolTip("Enable this for trusted certificates. Disable for self-signed certs or SSL decryption.")
+        layout.addWidget(self.verify_ssl_check, 4, 0, 1, 2)
+        
         # Remember checkbox
         self.save_check = QCheckBox("Remember server credentials (passwords stored securely in system keychain)")
         self.save_check.setChecked(True)
-        layout.addWidget(self.save_check, 4, 0, 1, 2)
+        layout.addWidget(self.save_check, 5, 0, 1, 2)
         
         # Add info label about security
         info_text = ("Note: Passwords are stored securely in your system's keychain\n"
                     "(macOS Keychain, Windows Credential Manager, or Linux Secret Service)")
         info_label = QLabel(info_text)
         info_label.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addWidget(info_label, 5, 0, 1, 2)
+        layout.addWidget(info_label, 6, 0, 1, 2)
         
         # Buttons
         button_box = QHBoxLayout()
@@ -291,15 +297,25 @@ class AddVCenterDialog(QDialog):
         
         button_box.addWidget(connect_btn)
         button_box.addWidget(cancel_btn)
-        layout.addLayout(button_box, 6, 0, 1, 2)
+        layout.addLayout(button_box, 7, 0, 1, 2)
 
     def on_server_selected(self, index):
         """Auto-fill saved server details and password"""
         hostname = self.server_combo.currentText()
         if hostname and hostname in self.saved_servers:
-            username = self.saved_servers[hostname]
+            server_data = self.saved_servers[hostname]
+            
+            # Handle both old format (string) and new format (dict)
+            if isinstance(server_data, str):
+                username = server_data
+                verify_ssl = False  # Default for old format
+            else:
+                username = server_data.get('username', '')
+                verify_ssl = server_data.get('verify_ssl', False)
+            
             self.hostname.setText(hostname)
             self.username.setText(username)
+            self.verify_ssl_check.setChecked(verify_ssl)
             
             # Try to get saved password
             password = self.config_manager.get_password(hostname, username)
@@ -313,7 +329,8 @@ class AddVCenterDialog(QDialog):
             'hostname': self.hostname.text(),
             'username': self.username.text(),
             'password': self.password.text(),
-            'save': self.save_check.isChecked()
+            'save': self.save_check.isChecked(),
+            'verify_ssl': self.verify_ssl_check.isChecked()
         }
 
     def closeEvent(self, event):
@@ -862,13 +879,15 @@ class SnapshotManagerWindow(QMainWindow):
                 # Show connection status without progress bar
                 self.status_label.setText(f"Connecting to {data['hostname']}...")
                 
-                # Create SSL context that ignores verification
+                # Create SSL context based on user preference
                 context = ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                
-                # Disable SSL verification warnings
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                if not data.get('verify_ssl', False):
+                    # Disable SSL verification
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    # Disable SSL verification warnings
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                # else: use default context with verification enabled
                 
                 # Set temporary socket timeout for this connection
                 old_timeout = socket.getdefaulttimeout()
@@ -880,7 +899,7 @@ class SnapshotManagerWindow(QMainWindow):
                         user=data['username'],
                         pwd=data['password'],
                         sslContext=context,
-                        disableSslCertValidation=True
+                        disableSslCertValidation=not data.get('verify_ssl', False)
                     )
                 finally:
                     # Restore original timeout
@@ -893,13 +912,18 @@ class SnapshotManagerWindow(QMainWindow):
                         self.vcenter_connections[data['hostname']] = si
                         self.active_credentials[data['hostname']] = {
                             'username': data['username'],
-                            'password': data['password']
+                            'password': data['password'],
+                            'verify_ssl': data.get('verify_ssl', False)
                         }
                     # Save credentials if requested
                     if data['save']:
                         self.status_label.setText("Saving credentials...")
                         
-                        self.saved_servers[data['hostname']] = data['username']
+                        # Save with new format including SSL settings
+                        self.saved_servers[data['hostname']] = {
+                            'username': data['username'],
+                            'verify_ssl': data.get('verify_ssl', False)
+                        }
                         self.config_manager.save_servers(self.saved_servers)
                         self.config_manager.save_password(
                             data['hostname'],
@@ -1193,16 +1217,20 @@ class SnapshotManagerWindow(QMainWindow):
                     if not creds:
                         continue
                         
+                    # Create SSL context based on saved preference
                     context = ssl.create_default_context()
-                    context.check_hostname = False
-                    context.verify_mode = ssl.CERT_NONE
+                    verify_ssl = creds.get('verify_ssl', False)
+                    if not verify_ssl:
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                     
                     new_si = SmartConnect(
                         host=hostname,
                         user=creds['username'],
                         pwd=creds['password'],
                         sslContext=context,
-                        disableSslCertValidation=True
+                        disableSslCertValidation=not verify_ssl
                     )
                     
                     if new_si:
@@ -1665,12 +1693,25 @@ class ConfigManager:
     def save_servers(self, servers):
         """Save server configurations (without passwords)"""
         try:
-            config = {
-                'servers': [{
-                    'hostname': server,
-                    'username': username
-                } for server, username in servers.items()]
-            }
+            # Handle both old format (dict) and new format (dict with settings)
+            server_list = []
+            for server, data in servers.items():
+                if isinstance(data, str):
+                    # Old format: just username
+                    server_list.append({
+                        'hostname': server,
+                        'username': data,
+                        'verify_ssl': False  # Default for existing configs
+                    })
+                else:
+                    # New format: dict with username and settings
+                    server_list.append({
+                        'hostname': server,
+                        'username': data.get('username', ''),
+                        'verify_ssl': data.get('verify_ssl', False)
+                    })
+            
+            config = {'servers': server_list}
             with open(self.config_file, 'w') as f:
                 json.dump(config, f, indent=4)
         except Exception as e:
@@ -1701,10 +1742,16 @@ class ConfigManager:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r') as f:
                     config = json.load(f)
-                    return {
-                        server['hostname']: server['username']
-                        for server in config.get('servers', [])
-                    }
+                    servers = {}
+                    for server in config.get('servers', []):
+                        hostname = server.get('hostname', '')
+                        if hostname:
+                            # Store full server data for new format
+                            servers[hostname] = {
+                                'username': server.get('username', ''),
+                                'verify_ssl': server.get('verify_ssl', False)
+                            }
+                    return servers
         except Exception as e:
             print(f"Failed to load config: {e}")
         return {}
@@ -1848,31 +1895,43 @@ class AutoConnectWorker(QThread):
             total = len(servers)
             connected = 0
             
-            for hostname, username in servers:
+            for hostname, server_data in servers:
+                # Handle both old format (string) and new format (dict)
+                if isinstance(server_data, str):
+                    username = server_data
+                    verify_ssl = False
+                else:
+                    username = server_data.get('username', '')
+                    verify_ssl = server_data.get('verify_ssl', False)
+                
                 password = self.config_manager.get_password(hostname, username)
                 if password:
                     try:
                         connected += 1
                         self.progress.emit(f"Auto-connecting to {hostname}... ({connected}/{total})")
                         
-                        # Create SSL context that ignores verification
+                        # Create SSL context based on saved preference
                         context = ssl.create_default_context()
-                        context.check_hostname = False
-                        context.verify_mode = ssl.CERT_NONE
-                        
-                        # Disable SSL verification warnings
-                        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                        if not verify_ssl:
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                            # Disable SSL verification warnings
+                            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                         
                         si = SmartConnect(
                             host=hostname,
                             user=username,
                             pwd=password,
                             sslContext=context,
-                            disableSslCertValidation=True
+                            disableSslCertValidation=not verify_ssl
                         )
                         
                         if si:
-                            credentials = {'username': username, 'password': password}
+                            credentials = {
+                                'username': username, 
+                                'password': password,
+                                'verify_ssl': verify_ssl
+                            }
                             self.connection_made.emit(hostname, si, credentials)
                         else:
                             self.error.emit(f"Failed to connect to {hostname}: No service instance returned")
