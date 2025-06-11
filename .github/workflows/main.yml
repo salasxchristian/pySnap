@@ -11,6 +11,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DISPLAY: ':99.0'
+      QT_SELECT: 'qt6'
     steps:
       - uses: actions/checkout@v4
       
@@ -19,6 +22,12 @@ jobs:
         with:
           python-version: '3.11.9'
           cache: 'pip'
+      
+      - name: Setup xvfb (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xinput0 libxcb-xfixes0 libxcb-shape0 libglib2.0-0 libgl1-mesa-dev
+          sudo /usr/bin/Xvfb $DISPLAY -screen 0 1280x1024x24 &
       
       - name: Install dependencies
         run: |
