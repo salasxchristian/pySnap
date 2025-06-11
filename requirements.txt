@@ -1,0 +1,5 @@
+pyqt6
+urllib3
+pyvmomi
+keyring
+pillow
