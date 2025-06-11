@@ -69,6 +69,7 @@ class SnapshotFetchWorker(QThread):
     def __init__(self, vcenter_connections):
         super().__init__()
         self.vcenter_connections = vcenter_connections
+        self.logger = logging.getLogger('pySnap')
 
     def run(self):
         try:
@@ -76,55 +77,71 @@ class SnapshotFetchWorker(QThread):
             completed_vcenters = 0
             
             for hostname, si in self.vcenter_connections.items():
-                ProgressTracker.emit_progress(
-                    self.progress, completed_vcenters, total_vcenters,
-                    "Connecting", f"{hostname}"
-                )
-                
-                content = si.RetrieveContent()
-                container = content.viewManager.CreateContainerView(
-                    content.rootFolder, [vim.VirtualMachine], True
-                )
-                
-                # Count VMs with snapshots for more detailed progress
-                snapshot_vms = 0
-                processed_vms = 0
-                
-                # First count VMs with snapshots
-                for vm in container.view:
-                    if vm.snapshot:
-                        snapshot_vms += 1
-                
-                if snapshot_vms > 0:
-                    # Now process VMs with progress updates
+                container = None
+                try:
+                    ProgressTracker.emit_progress(
+                        self.progress, completed_vcenters, total_vcenters,
+                        "Connecting", f"{hostname}"
+                    )
+                    
+                    content = si.RetrieveContent()
+                    container = content.viewManager.CreateContainerView(
+                        content.rootFolder, [vim.VirtualMachine], True
+                    )
+                    self.logger.info(f"Created container view for {hostname}")
+                    
+                    # Count VMs with snapshots for more detailed progress
+                    snapshot_vms = 0
+                    processed_vms = 0
+                    
+                    # First count VMs with snapshots
                     for vm in container.view:
                         if vm.snapshot:
-                            processed_vms += 1
-                            ProgressTracker.emit_progress(
-                                self.progress, processed_vms, snapshot_vms,
-                                "Processing", f"{vm.name}"
-                            )
-                            
-                            for snapshot in self.get_snapshots(vm.snapshot.rootSnapshotList):
-                                # Get creator information from snapshot description
-                                # VMware snapshots don't have a built-in createdBy property
-                                created_by = self.extract_creator_from_description(snapshot.description)
+                            snapshot_vms += 1
+                    
+                    if snapshot_vms > 0:
+                        # Now process VMs with progress updates
+                        for vm in container.view:
+                            if vm.snapshot:
+                                processed_vms += 1
+                                ProgressTracker.emit_progress(
+                                    self.progress, processed_vms, snapshot_vms,
+                                    "Processing", f"{vm.name}"
+                                )
                                 
-                                self.snapshot_found.emit({
-                                    'vm_name': vm.name,
-                                    'vcenter': hostname,
-                                    'name': snapshot.name,
-                                    'created': format_vmware_time(snapshot.createTime),
-                                    'created_by': created_by,
-                                    'description': snapshot.description or '',
-                                    'snapshot': snapshot,
-                                    'vm': vm,
-                                    'has_children': bool(snapshot.childSnapshotList),
-                                    'is_child': hasattr(snapshot, 'parent') and snapshot.parent is not None
-                                })
-                
-                container.Destroy()
-                completed_vcenters += 1
+                                for snapshot in self.get_snapshots(vm.snapshot.rootSnapshotList):
+                                    # Get creator information from snapshot description
+                                    # VMware snapshots don't have a built-in createdBy property
+                                    created_by = self.extract_creator_from_description(snapshot.description)
+                                    
+                                    self.snapshot_found.emit({
+                                        'vm_name': vm.name,
+                                        'vcenter': hostname,
+                                        'name': snapshot.name,
+                                        'created': format_vmware_time(snapshot.createTime),
+                                        'created_by': created_by,
+                                        'description': snapshot.description or '',
+                                        'snapshot': snapshot,
+                                        'vm': vm,
+                                        'has_children': bool(snapshot.childSnapshotList),
+                                        'is_child': hasattr(snapshot, 'parent') and snapshot.parent is not None
+                                    })
+                    
+                    completed_vcenters += 1
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing vCenter {hostname}: {str(e)}")
+                    self.error.emit(f"Error processing {hostname}: {str(e)}")
+                    
+                finally:
+                    # CRITICAL: Always destroy the container view to prevent resource leaks
+                    if container:
+                        try:
+                            container.Destroy()
+                            self.logger.info(f"Destroyed container view for {hostname}")
+                        except Exception as destroy_error:
+                            self.logger.error(f"Failed to destroy container view for {hostname}: {str(destroy_error)}")
+                            # Don't re-raise - we don't want destroy failure to mask original error
             
             # Final progress update
             ProgressTracker.emit_progress(
@@ -132,7 +149,9 @@ class SnapshotFetchWorker(QThread):
                 "Complete", "Snapshots retrieved"
             )
             self.finished.emit()
+            
         except Exception as e:
+            self.logger.error(f"Fatal error in snapshot fetch worker: {str(e)}")
             self.error.emit(str(e))
 
     def get_snapshots(self, snapshots):
