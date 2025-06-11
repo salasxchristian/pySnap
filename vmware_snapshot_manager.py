@@ -1,4 +1,5 @@
 import sys
+import threading
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, 
                             QLabel, QVBoxLayout, QHBoxLayout, QTreeWidget, 
                             QTreeWidgetItem, QDialog, QLineEdit, QGridLayout,
@@ -404,6 +405,7 @@ class SnapshotManagerWindow(QMainWindow):
         
         # Initialize variables
         self.vcenter_connections = {}
+        self.connections_lock = threading.Lock()  # Thread safety for connections dict
         self.snapshots = {}
         self.setup_logging()
         self.logger = logging.getLogger('pySnap')
@@ -868,11 +870,12 @@ class SnapshotManagerWindow(QMainWindow):
                 self.status_label.setText(f"Connected to {data['hostname']}, initializing...")
                 
                 if si:
-                    self.vcenter_connections[data['hostname']] = si
-                    self.active_credentials[data['hostname']] = {
-                        'username': data['username'],
-                        'password': data['password']
-                    }
+                    with self.connections_lock:
+                        self.vcenter_connections[data['hostname']] = si
+                        self.active_credentials[data['hostname']] = {
+                            'username': data['username'],
+                            'password': data['password']
+                        }
                     # Save credentials if requested
                     if data['save']:
                         self.status_label.setText("Saving credentials...")
@@ -900,29 +903,43 @@ class SnapshotManagerWindow(QMainWindow):
 
     def clear_connections(self):
         """Clear all vCenter connections"""
-        for hostname, si in self.vcenter_connections.items():
+        with self.connections_lock:
+            connections_copy = dict(self.vcenter_connections)
+            self.vcenter_connections.clear()
+            self.active_credentials.clear()  # Clear stored credentials
+        
+        # Disconnect outside the lock to avoid holding it during network operations
+        for hostname, si in connections_copy.items():
             try:
                 Disconnect(si)
             except:
                 pass
-        self.vcenter_connections.clear()
-        self.active_credentials.clear()  # Clear stored credentials
+        
         self.update_connection_status()
 
     def update_connection_status(self):
         """Update the connection status label"""
-        if not self.vcenter_connections:
+        with self.connections_lock:
+            connection_count = len(self.vcenter_connections)
+            hostnames = list(self.vcenter_connections.keys())
+            
+        if connection_count == 0:
             self.conn_label.setText("No active connections")
             self.clear_conn_btn.setEnabled(False)
             self.fetch_button.setEnabled(False)
             self.delete_button.setEnabled(False)
         else:
             status_text = ""
-            for hostname in self.vcenter_connections:
+            for hostname in hostnames:
                 try:
                     # Test connection
-                    self.vcenter_connections[hostname].CurrentTime()
-                    status_text += f"🟢 {hostname}  "  # Green circle for success
+                    with self.connections_lock:
+                        si = self.vcenter_connections.get(hostname)
+                    if si:
+                        si.CurrentTime()
+                        status_text += f"🟢 {hostname}  "  # Green circle for success
+                    else:
+                        status_text += f"🔴 {hostname}  "  # Red circle for failure
                 except:
                     status_text += f"🔴 {hostname}  "  # Red circle for failure
             
@@ -943,7 +960,11 @@ class SnapshotManagerWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText("Fetching snapshots...")
         
-        self.fetch_worker = SnapshotFetchWorker(self.vcenter_connections)
+        # Create a copy of connections for the worker thread
+        with self.connections_lock:
+            connections_copy = dict(self.vcenter_connections)
+            
+        self.fetch_worker = SnapshotFetchWorker(connections_copy)
         self.fetch_worker.progress.connect(self.update_progress)
         self.fetch_worker.snapshot_found.connect(self.add_snapshot_to_tree)
         self.fetch_worker.error.connect(self.on_fetch_error)
@@ -1118,7 +1139,11 @@ class SnapshotManagerWindow(QMainWindow):
         """Check all connections and reconnect if needed"""
         reconnect_needed = []
         
-        for hostname, si in list(self.vcenter_connections.items()):
+        # Get a copy of connections to check
+        with self.connections_lock:
+            connections_to_check = dict(self.vcenter_connections)
+            
+        for hostname, si in connections_to_check.items():
             try:
                 # Test connection by making a simple API call
                 si.CurrentTime()
@@ -1126,11 +1151,12 @@ class SnapshotManagerWindow(QMainWindow):
                 self.logger.warning(f"Connection to {hostname} lost: {str(e)}")
                 
                 # Add to reconnection list if we have credentials
-                if hostname in self.active_credentials:
-                    reconnect_needed.append(hostname)
-                else:
-                    # No credentials available, remove the connection
-                    self.vcenter_connections.pop(hostname, None)
+                with self.connections_lock:
+                    if hostname in self.active_credentials:
+                        reconnect_needed.append(hostname)
+                    else:
+                        # No credentials available, remove the connection
+                        self.vcenter_connections.pop(hostname, None)
         
         # If reconnections needed, show status without progress
         if reconnect_needed:
@@ -1142,7 +1168,12 @@ class SnapshotManagerWindow(QMainWindow):
                 self.status_label.setText(f"Reconnecting to {hostname}... ({completed}/{total})")
                 
                 try:
-                    creds = self.active_credentials[hostname]
+                    with self.connections_lock:
+                        creds = self.active_credentials.get(hostname)
+                    
+                    if not creds:
+                        continue
+                        
                     context = ssl.create_default_context()
                     context.check_hostname = False
                     context.verify_mode = ssl.CERT_NONE
@@ -1156,19 +1187,22 @@ class SnapshotManagerWindow(QMainWindow):
                     )
                     
                     if new_si:
-                        self.vcenter_connections[hostname] = new_si
+                        with self.connections_lock:
+                            self.vcenter_connections[hostname] = new_si
                         self.logger.info(f"Successfully reconnected to {hostname}")
                     else:
                         self.logger.error(f"Failed to reconnect to {hostname}")
                         # Remove failed connection
-                        self.vcenter_connections.pop(hostname, None)
-                        self.active_credentials.pop(hostname, None)
+                        with self.connections_lock:
+                            self.vcenter_connections.pop(hostname, None)
+                            self.active_credentials.pop(hostname, None)
                         
                 except Exception as reconnect_error:
                     self.logger.error(f"Failed to reconnect to {hostname}: {str(reconnect_error)}")
                     # Remove failed connection
-                    self.vcenter_connections.pop(hostname, None)
-                    self.active_credentials.pop(hostname, None)
+                    with self.connections_lock:
+                        self.vcenter_connections.pop(hostname, None)
+                        self.active_credentials.pop(hostname, None)
             
             # Reset status when done
             self.status_label.setText("Ready")
@@ -1214,7 +1248,10 @@ class SnapshotManagerWindow(QMainWindow):
         Get the vCenter username from active credentials, stripping domain if present.
         Returns the first available username, or system user as fallback.
         """
-        for hostname, credentials in self.active_credentials.items():
+        with self.connections_lock:
+            credentials_copy = dict(self.active_credentials)
+            
+        for hostname, credentials in credentials_copy.items():
             username = credentials.get('username', '')
             if username:
                 # Strip domain part (e.g., "csalas@vsphere.local" -> "csalas")
@@ -1249,7 +1286,10 @@ class SnapshotManagerWindow(QMainWindow):
 
     def create_snapshots(self):
         """Show dialog to create snapshots in bulk"""
-        if not self.vcenter_connections:
+        with self.connections_lock:
+            has_connections = bool(self.vcenter_connections)
+            
+        if not has_connections:
             QMessageBox.warning(self, "Warning", "No active vCenter connections")
             return
             
@@ -1270,8 +1310,12 @@ class SnapshotManagerWindow(QMainWindow):
         # Get the vCenter username for creator tracking
         vcenter_username = self.get_current_vcenter_username()
         
+        # Create a copy of connections for the worker thread
+        with self.connections_lock:
+            connections_copy = dict(self.vcenter_connections)
+            
         self.create_worker = SnapshotCreateWorker(
-            self.vcenter_connections, 
+            connections_copy, 
             servers, 
             description,
             memory,
@@ -1395,8 +1439,9 @@ class SnapshotManagerWindow(QMainWindow):
     
     def handle_auto_connection(self, hostname, si, credentials):
         """Handle successful auto-connection"""
-        self.vcenter_connections[hostname] = si
-        self.active_credentials[hostname] = credentials
+        with self.connections_lock:
+            self.vcenter_connections[hostname] = si
+            self.active_credentials[hostname] = credentials
         self.logger.info(f"Auto-connected to {hostname}")
     
     def on_auto_connect_finished(self):
