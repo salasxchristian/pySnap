@@ -18,13 +18,13 @@ from datetime import datetime, timedelta, timezone
 import urllib3
 import time
 from PyQt6.QtGui import QColor, QBrush, QIcon
-import keyring
 from PyQt6.QtCore import QSettings
 import getpass
 import re
 from snapshot_filters import SnapshotFilterPanel
 from version import __version__
 from secure_password import SecurePassword
+from encrypted_config_manager import EncryptedConfigManager
 
 # Built by Christian Salas
 
@@ -284,7 +284,7 @@ class AddVCenterDialog(QDialog):
         layout.addWidget(QLabel("Saved Servers:"), 0, 0)
         self.server_combo = QComboBox()
         self.server_combo.addItems([''] + list(saved_servers.keys()))  # Add empty option
-        self.server_combo.activated.connect(self.on_server_selected)
+        self.server_combo.currentTextChanged.connect(self.on_server_selected)
         layout.addWidget(self.server_combo, 0, 1)
         
         # Connection details
@@ -307,13 +307,13 @@ class AddVCenterDialog(QDialog):
         layout.addWidget(self.verify_ssl_check, 4, 0, 1, 2)
         
         # Remember checkbox
-        self.save_check = QCheckBox("Remember server credentials (passwords stored securely in system keychain)")
+        self.save_check = QCheckBox("Remember server credentials (passwords stored securely in encrypted database)")
         self.save_check.setChecked(True)
         layout.addWidget(self.save_check, 5, 0, 1, 2)
         
         # Add info label about security
-        info_text = ("Note: Passwords are stored securely in your system's keychain\n"
-                    "(macOS Keychain, Windows Credential Manager, or Linux Secret Service)")
+        info_text = ("Note: Passwords are encrypted and stored securely in the application database\n"
+                    "Database encryption key is stored in your system's keychain")
         info_label = QLabel(info_text)
         info_label.setStyleSheet("color: gray; font-size: 10px;")
         layout.addWidget(info_label, 6, 0, 1, 2)
@@ -329,9 +329,8 @@ class AddVCenterDialog(QDialog):
         button_box.addWidget(cancel_btn)
         layout.addLayout(button_box, 7, 0, 1, 2)
 
-    def on_server_selected(self, index):
+    def on_server_selected(self, hostname):
         """Auto-fill saved server details and password"""
-        hostname = self.server_combo.currentText()
         if hostname and hostname in self.saved_servers:
             server_data = self.saved_servers[hostname]
             
@@ -722,7 +721,7 @@ class SnapshotManagerWindow(QMainWindow):
             json_path = os.path.join(script_dir, 'snapshots.json')
             
             if not os.path.exists(json_path):
-                messagebox.showerror("Error", "snapshots.json not found. Please run export_snapshots.ps1 first.")
+                QMessageBox.critical(None, "Error", "snapshots.json not found. Please run export_snapshots.ps1 first.")
                 return []
                 
             with open(json_path, 'r') as f:
@@ -734,10 +733,10 @@ class SnapshotManagerWindow(QMainWindow):
             return data
             
         except json.JSONDecodeError as e:
-            messagebox.showerror("Error", f"Failed to parse JSON file:\n{e}")
+            QMessageBox.critical(None, "Error", f"Failed to parse JSON file:\n{e}")
             return []
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to read snapshots:\n{e}")
+            QMessageBox.critical(None, "Error", f"Failed to read snapshots:\n{e}")
             return []
 
     def refresh_snapshots(self):
@@ -1775,92 +1774,9 @@ class SnapshotManagerWindow(QMainWindow):
             "<p><i>Tip: Independent snapshots (not grayed out) can be safely deleted using pySnap.</i></p>"
         )
 
-class ConfigManager:
-    def __init__(self):
-        self.config_file = os.path.join(os.path.expanduser("~"), ".vmware_snapshot_viewer.json")
-        self.keyring_service = "vmware_snapshot_manager"
-    
-    def save_servers(self, servers):
-        """Save server configurations (without passwords)"""
-        try:
-            # Handle both old format (dict) and new format (dict with settings)
-            server_list = []
-            for server, data in servers.items():
-                if isinstance(data, str):
-                    # Old format: just username
-                    server_list.append({
-                        'hostname': server,
-                        'username': data,
-                        'verify_ssl': False  # Default for existing configs
-                    })
-                else:
-                    # New format: dict with username and settings
-                    server_list.append({
-                        'hostname': server,
-                        'username': data.get('username', ''),
-                        'verify_ssl': data.get('verify_ssl', False)
-                    })
-            
-            config = {'servers': server_list}
-            with open(self.config_file, 'w') as f:
-                json.dump(config, f, indent=4)
-        except Exception as e:
-            print(f"Failed to save config: {e}")
-    
-    def save_password(self, hostname, username, secure_password):
-        """Save SecurePassword to keyring"""
-        try:
-            key = f"{hostname}:{username}"
-            if isinstance(secure_password, SecurePassword):
-                password_str = secure_password.get_password()
-                result = keyring.set_password(self.keyring_service, key, password_str)
-                # Clear the temporary string
-                password_str = '\0' * len(password_str)
-                del password_str
-                return result
-            else:
-                # Fallback for backward compatibility
-                keyring.set_password(self.keyring_service, key, secure_password)
-                return True
-        except Exception as e:
-            print(f"Failed to save password: {e}")
-            return False
-    
-    def get_password(self, hostname, username):
-        """Get password from keyring and return as SecurePassword"""
-        try:
-            key = f"{hostname}:{username}"
-            password_str = keyring.get_password(self.keyring_service, key)
-            if password_str:
-                secure_pass = SecurePassword(password_str)
-                # Clear the temporary string
-                password_str = '\0' * len(password_str)
-                del password_str
-                return secure_pass
-            return None
-        except Exception as e:
-            print(f"Failed to get password: {e}")
-            return None
-
-    def load_servers(self):
-        """Load saved server configurations"""
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    config = json.load(f)
-                    servers = {}
-                    for server in config.get('servers', []):
-                        hostname = server.get('hostname', '')
-                        if hostname:
-                            # Store full server data for new format
-                            servers[hostname] = {
-                                'username': server.get('username', ''),
-                                'verify_ssl': server.get('verify_ssl', False)
-                            }
-                    return servers
-        except Exception as e:
-            print(f"Failed to load config: {e}")
-        return {}
+# Legacy ConfigManager class replaced by EncryptedConfigManager
+# Keeping this as an alias for compatibility during transition
+ConfigManager = EncryptedConfigManager
 
 class CreateSnapshotsDialog(QDialog):
     def __init__(self, parent=None):
