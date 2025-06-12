@@ -24,6 +24,7 @@ import getpass
 import re
 from snapshot_filters import SnapshotFilterPanel
 from version import __version__
+from secure_password import SecurePassword
 
 # Built by Christian Salas
 
@@ -58,6 +59,36 @@ class ProgressTracker:
         else:
             message = f"{operation} ({current}/{total})"
         signal.emit(current, total, message)
+
+class SecurePasswordField(QLineEdit):
+    """Password field that stores data securely and clears on demand."""
+    
+    def __init__(self):
+        super().__init__()
+        self.setEchoMode(QLineEdit.EchoMode.Password)
+        self._secure_password = SecurePassword()
+        
+        # Update secure storage whenever text changes
+        self.textChanged.connect(self._update_secure_storage)
+    
+    def _update_secure_storage(self):
+        """Update internal secure storage when text changes."""
+        self._secure_password.clear()
+        self._secure_password = SecurePassword(super().text())
+    
+    def get_secure_password(self) -> SecurePassword:
+        """Get the secure password object."""
+        return self._secure_password
+    
+    def clear_secure(self):
+        """Securely clear both display and internal storage."""
+        self._secure_password.clear()
+        self.clear()
+    
+    def setText(self, text: str):
+        """Override setText to update secure storage."""
+        super().setText(text)
+        self._update_secure_storage()
 
 class SnapshotFetchWorker(QThread):
     """Worker thread for fetching snapshots"""
@@ -266,8 +297,7 @@ class AddVCenterDialog(QDialog):
         layout.addWidget(self.username, 2, 1)
         
         layout.addWidget(QLabel("Password:"), 3, 0)
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password = SecurePasswordField()
         layout.addWidget(self.password, 3, 1)
         
         # SSL verification checkbox
@@ -318,9 +348,14 @@ class AddVCenterDialog(QDialog):
             self.verify_ssl_check.setChecked(verify_ssl)
             
             # Try to get saved password
-            password = self.config_manager.get_password(hostname, username)
-            if password:
-                self.password.setText(password)
+            secure_password = self.config_manager.get_password(hostname, username)
+            if secure_password and not secure_password.is_empty():
+                # Get string briefly, set it, then clear
+                password_str = secure_password.get_password()
+                self.password.setText(password_str)
+                # Clear the temporary string
+                password_str = '\0' * len(password_str)
+                del password_str
             
             self.password.setFocus()
 
@@ -328,7 +363,7 @@ class AddVCenterDialog(QDialog):
         return {
             'hostname': self.hostname.text(),
             'username': self.username.text(),
-            'password': self.password.text(),
+            'password': self.password.get_secure_password(),
             'save': self.save_check.isChecked(),
             'verify_ssl': self.verify_ssl_check.isChecked()
         }
@@ -455,6 +490,15 @@ class SnapshotManagerWindow(QMainWindow):
         
         # Store credentials for reconnection
         self.active_credentials = {}  # Store credentials for active connections
+        
+        # Session management for security
+        self.session_timeout = 30 * 60 * 1000  # 30 minutes in milliseconds
+        self.last_activity = time.time()
+        
+        # Session timeout timer
+        self.session_timer = QTimer(self)
+        self.session_timer.timeout.connect(self.check_session_timeout)
+        self.session_timer.start(60000)  # Check every minute
         
         # Create central widget and main layout
         central_widget = QWidget()
@@ -893,15 +937,20 @@ class SnapshotManagerWindow(QMainWindow):
                 old_timeout = socket.getdefaulttimeout()
                 socket.setdefaulttimeout(10.0)
                 
+                # Get password string briefly for connection
+                password_str = data['password'].get_password()
                 try:
                     si = SmartConnect(
                         host=data['hostname'],
                         user=data['username'],
-                        pwd=data['password'],
+                        pwd=password_str,
                         sslContext=context,
                         disableSslCertValidation=not data.get('verify_ssl', False)
                     )
                 finally:
+                    # Clear the temporary password string
+                    password_str = '\0' * len(password_str)
+                    del password_str
                     # Restore original timeout
                     socket.setdefaulttimeout(old_timeout)
                 
@@ -912,7 +961,7 @@ class SnapshotManagerWindow(QMainWindow):
                         self.vcenter_connections[data['hostname']] = si
                         self.active_credentials[data['hostname']] = {
                             'username': data['username'],
-                            'password': data['password'],
+                            'password': data['password'],  # This is now a SecurePassword object
                             'verify_ssl': data.get('verify_ssl', False)
                         }
                     # Save credentials if requested
@@ -1225,13 +1274,20 @@ class SnapshotManagerWindow(QMainWindow):
                         context.verify_mode = ssl.CERT_NONE
                         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                     
-                    new_si = SmartConnect(
-                        host=hostname,
-                        user=creds['username'],
-                        pwd=creds['password'],
-                        sslContext=context,
-                        disableSslCertValidation=not verify_ssl
-                    )
+                    # Get password string briefly for connection
+                    password_str = creds['password'].get_password()
+                    try:
+                        new_si = SmartConnect(
+                            host=hostname,
+                            user=creds['username'],
+                            pwd=password_str,
+                            sslContext=context,
+                            disableSslCertValidation=not verify_ssl
+                        )
+                    finally:
+                        # Clear the temporary password string
+                        password_str = '\0' * len(password_str)
+                        del password_str
                     
                     if new_si:
                         with self.connections_lock:
@@ -1412,7 +1468,41 @@ class SnapshotManagerWindow(QMainWindow):
         """Save window position when closing"""
         settings = QSettings()
         settings.setValue("WindowGeometry", self.saveGeometry())
+        # Clear sensitive data on exit
+        self.clear_sensitive_data()
         super().closeEvent(event)
+
+    def check_session_timeout(self):
+        """Check if session has timed out and clear credentials if needed."""
+        if time.time() - self.last_activity > (self.session_timeout / 1000):
+            self.clear_sensitive_data()
+            self.status_label.setText("Session timed out - credentials cleared for security")
+            QTimer.singleShot(3000, lambda: self.status_label.setText("Ready"))
+    
+    def clear_sensitive_data(self):
+        """Clear all sensitive data from memory."""
+        # Clear active credentials
+        for hostname, creds in self.active_credentials.items():
+            if 'password' in creds and hasattr(creds['password'], 'clear'):
+                creds['password'].clear()
+        self.active_credentials.clear()
+        
+        # Clear connections
+        self.clear_connections()
+    
+    def update_last_activity(self):
+        """Update last activity timestamp."""
+        self.last_activity = time.time()
+    
+    def mousePressEvent(self, event):
+        """Override to track user activity."""
+        self.update_last_activity()
+        super().mousePressEvent(event)
+    
+    def keyPressEvent(self, event):
+        """Override to track user activity."""
+        self.update_last_activity()
+        super().keyPressEvent(event)
 
     def update_progress(self, value, total, operation):
         """
@@ -1717,21 +1807,37 @@ class ConfigManager:
         except Exception as e:
             print(f"Failed to save config: {e}")
     
-    def save_password(self, hostname, username, password):
-        """Save password securely in system keyring"""
+    def save_password(self, hostname, username, secure_password):
+        """Save SecurePassword to keyring"""
         try:
             key = f"{hostname}:{username}"
-            keyring.set_password(self.keyring_service, key, password)
-            return True
+            if isinstance(secure_password, SecurePassword):
+                password_str = secure_password.get_password()
+                result = keyring.set_password(self.keyring_service, key, password_str)
+                # Clear the temporary string
+                password_str = '\0' * len(password_str)
+                del password_str
+                return result
+            else:
+                # Fallback for backward compatibility
+                keyring.set_password(self.keyring_service, key, secure_password)
+                return True
         except Exception as e:
             print(f"Failed to save password: {e}")
             return False
     
     def get_password(self, hostname, username):
-        """Get password from system keyring"""
+        """Get password from keyring and return as SecurePassword"""
         try:
             key = f"{hostname}:{username}"
-            return keyring.get_password(self.keyring_service, key)
+            password_str = keyring.get_password(self.keyring_service, key)
+            if password_str:
+                secure_pass = SecurePassword(password_str)
+                # Clear the temporary string
+                password_str = '\0' * len(password_str)
+                del password_str
+                return secure_pass
+            return None
         except Exception as e:
             print(f"Failed to get password: {e}")
             return None
@@ -1904,8 +2010,8 @@ class AutoConnectWorker(QThread):
                     username = server_data.get('username', '')
                     verify_ssl = server_data.get('verify_ssl', False)
                 
-                password = self.config_manager.get_password(hostname, username)
-                if password:
+                secure_password = self.config_manager.get_password(hostname, username)
+                if secure_password and not secure_password.is_empty():
                     try:
                         connected += 1
                         self.progress.emit(f"Auto-connecting to {hostname}... ({connected}/{total})")
@@ -1918,18 +2024,25 @@ class AutoConnectWorker(QThread):
                             # Disable SSL verification warnings
                             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                         
-                        si = SmartConnect(
-                            host=hostname,
-                            user=username,
-                            pwd=password,
-                            sslContext=context,
-                            disableSslCertValidation=not verify_ssl
-                        )
+                        # Get password string briefly for connection
+                        password_str = secure_password.get_password()
+                        try:
+                            si = SmartConnect(
+                                host=hostname,
+                                user=username,
+                                pwd=password_str,
+                                sslContext=context,
+                                disableSslCertValidation=not verify_ssl
+                            )
+                        finally:
+                            # Clear the temporary password string
+                            password_str = '\0' * len(password_str)
+                            del password_str
                         
                         if si:
                             credentials = {
                                 'username': username, 
-                                'password': password,
+                                'password': secure_password,
                                 'verify_ssl': verify_ssl
                             }
                             self.connection_made.emit(hostname, si, credentials)
