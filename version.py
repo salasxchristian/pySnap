@@ -1,5 +1,5 @@
 """
-Version information for VMware Snapshot Manager
+Version information for pySnap
 """
 
 __version__ = "1.3.0"

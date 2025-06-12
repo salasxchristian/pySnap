@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test runner for VMware Snapshot Manager
+Test runner for pySnap
 Runs all test files and provides a summary.
 """
 

@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec file for pySnap - VMware Snapshot Manager
+PyInstaller spec file for pySnap
 macOS version (Universal binary for Intel + Apple Silicon)
 """
 
@@ -93,11 +93,11 @@ app = BUNDLE(
     exe,
     name='pySnap.app',
     icon='icons/app_icon.icns',
-    bundle_identifier='net.lausd.pysnap',
+    bundle_identifier='com.example.pysnap',
     info_plist={
         'CFBundleName': 'pySnap',
-        'CFBundleDisplayName': 'pySnap - VMware Snapshot Manager',
-        'CFBundleIdentifier': 'net.lausd.pysnap',
+        'CFBundleDisplayName': 'pySnap',
+        'CFBundleIdentifier': 'com.example.pysnap',
         'CFBundleVersion': __version__,
         'CFBundleShortVersionString': __version__,
         'CFBundleExecutable': 'pySnap',
@@ -108,7 +108,7 @@ app = BUNDLE(
         'LSApplicationCategoryType': 'public.app-category.utilities',
         'NSHighResolutionCapable': True,
         'NSRequiresAquaSystemAppearance': False,  # Support dark mode
-        'NSHumanReadableCopyright': 'Copyright © 2024 LAUSD. All rights reserved.',
+        'NSHumanReadableCopyright': 'Copyright © 2024. All rights reserved.',
         'NSPrincipalClass': 'NSApplication',
         'NSAppleScriptEnabled': False,
         'LSBackgroundOnly': False,
